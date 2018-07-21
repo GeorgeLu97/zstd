@@ -173,8 +173,19 @@ BMK_benchParam(BMK_result_t* resultPtr,
     return res.error;
 }
 
+typedef struct {
+    BMK_result_t result;
+    ZSTD_compressionParameters params;
+} winnerInfo_t;
+
+UTIL_time_t start_time;
+
+#define TIMELOOP_NANOSEC (1000000000ULL)
+
 static void BMK_printWinner(FILE* f, U32 cLevel, BMK_result_t result, ZSTD_compressionParameters params, size_t srcSize)
 {
+    U64 time = UTIL_clockSpanNano(start_time);
+    U64 minutes = time / (60ULL * TIMELOOP_NANOSEC);
     char lvlstr[15] = "Custom Level";
     DISPLAY("\r%79s\r", "");
     fprintf(f,"    {%3u,%3u,%3u,%3u,%3u,%3u, %s },  ",
@@ -184,15 +195,13 @@ static void BMK_printWinner(FILE* f, U32 cLevel, BMK_result_t result, ZSTD_compr
         snprintf(lvlstr, 15, "  Level %2u  ", cLevel);
     }
     fprintf(f,
-        "/* %s */   /* R:%5.3f at %5.1f MB/s - %5.1f MB/s */\n",
+        "/* %s */   /* R:%5.3f at %5.1f MB/s - %5.1f MB/s */",
         lvlstr, (double)srcSize / result.cSize, result.cSpeed / 1000000., result.dSpeed / 1000000.);
+
+
+    fprintf(f, "%1lu:%2lu:%05.2f\n", (unsigned long)minutes/60, (unsigned long)minutes % 60, (double)(time - minutes * TIMELOOP_NANOSEC * 60ULL)/TIMELOOP_NANOSEC);
 }
 
-
-typedef struct {
-    BMK_result_t result;
-    ZSTD_compressionParameters params;
-} winnerInfo_t;
 
 static void BMK_printWinners2(FILE* f, const winnerInfo_t* winners, size_t srcSize)
 {
@@ -835,6 +844,8 @@ int main(int argc, const char** argv)
     U32 optimizer = 0;
     U32 main_pause = 0;
     U32 targetSpeed = 0;
+
+    start_time = UTIL_getTime();
 
     assert(argc>=1);   /* for exename */
 
