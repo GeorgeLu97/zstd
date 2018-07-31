@@ -406,7 +406,9 @@ int main(int argCount, const char* argv[])
         singleThread = 0,
         ultra=0;
     double compressibility = 0.5;
+#ifndef ZSTD_NOBENCH
     BMK_advancedParams_t adv = BMK_initAdvancedParams();
+#endif
     unsigned bench_nbSeconds = 3;   /* would be better if this value was synchronized from bench */
     size_t blockSize = 0;
     zstd_operation_mode operation = zom_compress;
@@ -867,7 +869,7 @@ int main(int argCount, const char* argv[])
         }
 
 #else
-        (void)bench_nbSeconds; (void)blockSize; (void)setRealTimePrio; (void)separateFiles;
+        (void)bench_nbSeconds; (void)blockSize; (void)setRealTimePrio; (void)separateFiles; (void)compressibility;
 #endif
         goto _end;
     }
