@@ -243,6 +243,11 @@ static double g_ratioMultiplier = 5.;
 static U32 g_strictness = PARAM_UNSET; /* range 1 - 100, measure of how strict  */
 static BMK_result_t g_lvltarget;
 
+typedef struct {
+    int min[NUM_PARAMS];
+    int max[NUM_PARAMS];
+} paramRanges_t;
+
 typedef enum {
     directMap,
     xxhashMap,
@@ -253,8 +258,7 @@ typedef struct {
     memoTableType_t tableType;
     BYTE* table;
     size_t tableLen;
-    varInds_t varArray[NUM_PARAMS];
-    size_t varLen;
+    paramRanges_t varyRange;
 } memoTable_t;
 
 typedef struct {
@@ -419,6 +423,18 @@ static paramValues_t emptyParams(void) {
     return p;
 }
 
+static paramRanges_t emptyRange(void) {
+    U32 i;
+    paramRanges_t p;
+    for(i = 0; i < NUM_PARAMS; i++) {
+        p.max[i] = maxtable[i];
+        p.min[i] = mintable[i];
+    }
+    p.max[fadt_ind] = 1;
+    p.min[fadt_ind] = -1; //TODO: make this U32 to int translation less bad, include defaults table
+    return p;
+}
+
 static winnerInfo_t initWinnerInfo(const paramValues_t p) {
     winnerInfo_t w1;
     w1.result.cSpeed = 0.;
@@ -443,6 +459,16 @@ static void paramVaryOnce(const varInds_t paramIndex, const int amt, paramValues
     ptr->vals[paramIndex] = rangeMap(paramIndex, invRangeMap(paramIndex, ptr->vals[paramIndex]) + amt);
 }
 
+/* returns > 0 if fails */
+static int rangeSafeParamVaryOnce(const varInds_t paramIndex, const int amt, paramValues_t* ptr, const paramRanges_t pr) {
+    const int indval = invRangeMap(paramIndex, ptr->vals[paramIndex]) + amt;
+    if(pr.min[paramIndex] <= indval && indval <= pr.max[paramIndex]) {
+        paramVaryOnce(paramIndex, amt, ptr);
+        return 0;
+    }
+    return 1;
+}
+
 /* varies ptr by nbChanges respecting varyParams*/
 static void paramVariation(paramValues_t* ptr, memoTable_t* mtAll, const U32 nbChanges)
 {
@@ -452,8 +478,8 @@ static void paramVariation(paramValues_t* ptr, memoTable_t* mtAll, const U32 nbC
         U32 i;
         p = *ptr;
         for (i = 0 ; i < nbChanges ; i++) {
-            const U32 changeID = (U32)FUZ_rand(&g_rand) % (mtAll[p.vals[strt_ind]].varLen << 1);
-            paramVaryOnce(mtAll[p.vals[strt_ind]].varArray[changeID >> 1], ((changeID & 1) << 1) - 1, &p);
+            memoTable_t mt = mtAll[p.vals[strt_ind]];
+            while(rangeSafeParamVaryOnce(FUZ_rand(&g_rand) % NUM_PARAMS, ((FUZ_rand(&g_rand) & 1) << 1) - 1, &p, mt.varyRange));
         }
         validated = paramValid(p);
     }
@@ -579,6 +605,54 @@ static void optimizerAdjustInput(paramValues_t* pc, const size_t maxBlockSize) {
     }
 
     if(pc->vals[wlog_ind] != PARAM_UNSET && pc->vals[clog_ind] != PARAM_UNSET) {
+        U32 maxclog;
+        if(pc->vals[strt_ind] == PARAM_UNSET || pc->vals[strt_ind] >= (U32)ZSTD_btlazy2) {
+            maxclog = pc->vals[wlog_ind] + 1;
+        } else {
+            maxclog = pc->vals[wlog_ind];
+        }
+
+        if(pc->vals[clog_ind] > maxclog) {
+            pc->vals[clog_ind] = maxclog;
+            DISPLAY("Warning: chainlog too much larger than windowLog size, adjusted to %u\n", pc->vals[clog_ind]);
+        }
+    }
+
+    if(pc->vals[wlog_ind] != PARAM_UNSET && pc->vals[hlog_ind] != PARAM_UNSET) {
+        if(pc->vals[wlog_ind] + 1 < pc->vals[hlog_ind]) {
+            pc->vals[hlog_ind] = pc->vals[wlog_ind] + 1;
+            DISPLAY("Warning: hashlog too much larger than windowLog size, adjusted to %u\n", pc->vals[hlog_ind]);
+        }
+    }
+    
+    if(pc->vals[slog_ind] != PARAM_UNSET && pc->vals[clog_ind] != PARAM_UNSET) {
+        if(pc->vals[slog_ind] > pc->vals[clog_ind]) {
+            pc->vals[clog_ind] = pc->vals[slog_ind];
+            DISPLAY("Warning: searchLog larger than chainLog, adjusted to %u\n", pc->vals[slog_ind]);
+        }
+    }
+}
+
+#define CLAMP(varind, val) MIN(MAX(mintable[varind], val), maxtable[varind]);
+
+static void optimizerAdjustInput(paramRanges_t* pc, const size_t maxBlockSize) {
+    varInds_t v;
+
+    {
+        U32 sshb = maxBlockSize > 1 ? ZSTD_highbit32((U32)(maxBlockSize-1)) + 1 : 1;
+        /* edge case of highBit not working for 0 */
+
+        if(maxBlockSize < (1ULL << 31) && sshb < pc->max[wlog_ind]) {
+            U32 adjust = MAX(mintable[wlog_ind], sshb);
+            if(adjust != pc->vals[wlog_ind]) {
+                pc->max[wlog_ind] = adjust;
+                pc->min[wlog_ind] = MIN(pc->min[wlog_ind], adjust);
+                DISPLAY("Warning: windowLog larger than src/block size, adjusted to %u\n", pc->vals[wlog_ind]);
+            }
+        }
+    }
+
+    {
         U32 maxclog;
         if(pc->vals[strt_ind] == PARAM_UNSET || pc->vals[strt_ind] >= (U32)ZSTD_btlazy2) {
             maxclog = pc->vals[wlog_ind] + 1;
@@ -1210,57 +1284,55 @@ static int createContexts(contexts_t* ctx, const char* dictFileName) {
 *  Optimizer Memoization Functions 
 **************************************/
 
-/* return: new length */
-/* keep old array, will need if iter over strategy. */
-/* prunes useless params */
-static size_t sanitizeVarArray(varInds_t* varNew, const size_t varLength, const varInds_t* varArray, const ZSTD_strategy strat) {
-    size_t i, j = 0;
-    for(i = 0; i < varLength; i++) {
-        if( !((varArray[i] == clog_ind && strat == ZSTD_fast)
-            || (varArray[i] == slog_ind && strat == ZSTD_fast)
-            || (varArray[i] == slog_ind && strat == ZSTD_dfast) 
-            || (varArray[i] == tlen_ind && strat != ZSTD_btopt && strat != ZSTD_btultra && strat != ZSTD_fast))) {
-            varNew[j] = varArray[i];
-            j++;
-        }
+static paramRanges_t sanitizeRanges(paramRanges_t pr, const ZSTD_strategy strat) {
+    if(strat == ZSTD_fast) {
+        pr.max[clog_ind] = pr.min[clog_ind];
+        pr.max[slog_ind] = pr.min[slog_ind];
+    } else if(strat == ZSTD_dfast) {
+        pr.max[slog_ind] = pr.min[slog_ind];
     }
-    return j;
+
+    if(strat != ZSTD_btopt && strat != ZSTD_btultra && strat != ZSTD_fast) {
+        pr.max[tlen_ind] = pr.min[tlen_ind];
+    }
+
+    return pr;
 }
 
-/* res should be NUM_PARAMS size */
-/* constructs varArray from paramValues_t style parameter */
-/* pass in using dict. */
-static size_t variableParams(const paramValues_t paramConstraints, varInds_t* res, const int usingDictionary) {
+//transforms from value range to index range
+static paramRanges_t variableParams(paramRanges_t pr, const int usingDictionary) {
     varInds_t i;
-    size_t j = 0;
+
+    if(!usingDictionary) { pr.max[fadt_ind] = 0; pr.min[fadt_ind] = 0; } 
+
     for(i = 0; i < NUM_PARAMS; i++) {
-        if(paramConstraints.vals[i] == PARAM_UNSET) {
-            if(i == fadt_ind && !usingDictionary) continue; /* don't use fadt if no dictionary */
-            res[j] = i; j++;
-        }
+        int j = 0;
+        //Linear Search
+        while(j < (int)rangetable[i] && (int)rangeMap(i, j) < pr.min[i]) { j++; }
+        pr.min[i] = j;
+        while(j < (int)rangetable[i] && (int)rangeMap(i, j) <= pr.max[i]) { j++; }
+        pr.max[i] = j - 1;
+        if(pr.max[i] < pr.min[i]) { DISPLAY("No parameter sets within constraints\n"); exit(1); }
     }
-    return j;
+    return pr;
 }
 
-/* length of memo table given free variables */
-static size_t memoTableLen(const varInds_t* varyParams, const size_t varyLen) {
+static size_t memoTableLen(const paramRanges_t pr) {
     size_t arrayLen = 1;
-    size_t i;
-    for(i = 0; i < varyLen; i++) {
-        if(varyParams[i] == strt_ind) continue; /* strategy separated by table */
-        arrayLen *= rangetable[varyParams[i]];
+    varInds_t i;
+    for(i = 0; i < NUM_PARAMS; i++) {
+        if(i == strt_ind) continue;
+        arrayLen *= (pr.max[i] - pr.min[i] + 1);
     }
     return arrayLen;
 }
 
-/* returns unique index in memotable of compression parameters */
-static unsigned memoTableIndDirect(const paramValues_t* ptr, const varInds_t* varyParams, const size_t varyLen) {
-    size_t i;
-    unsigned ind = 0;
-    for(i = 0; i < varyLen; i++) {
-        varInds_t v = varyParams[i];
-        if(v == strt_ind) continue; /* exclude strategy from memotable */
-        ind *= rangetable[v]; ind += (unsigned)invRangeMap(v, ptr->vals[v]);
+static size_t memoTableIndDirect(const paramValues_t* ptr, const paramRanges_t pr) {
+    varInds_t i;
+    size_t ind = 0;
+    for(i = 0; i < NUM_PARAMS; i++) {
+        if(i == strt_ind) continue;
+        ind *= (pr.max[i] - pr.min[i] + 1); ind += (invRangeMap(i, ptr->vals[i]) - pr.min[i]); //TODO: check that invRangeMap doesn't ever get passed 0-sanitized params. 
     }
     return ind;
 }
@@ -1269,7 +1341,7 @@ static size_t memoTableGet(const memoTable_t* memoTableArray, const paramValues_
     const memoTable_t mt = memoTableArray[p.vals[strt_ind]];
     switch(mt.tableType) {
         case directMap:
-            return mt.table[memoTableIndDirect(&p, mt.varArray, mt.varLen)];
+            return mt.table[memoTableIndDirect(&p, mt.varyRange)];
         case xxhashMap:
             return mt.table[(XXH64(&p.vals, sizeof(U32) * NUM_PARAMS, 0) >> 3) % mt.tableLen];
         case noMemo:
@@ -1282,7 +1354,7 @@ static void memoTableSet(const memoTable_t* memoTableArray, const paramValues_t 
     const memoTable_t mt = memoTableArray[p.vals[strt_ind]];
     switch(mt.tableType) {
         case directMap:
-            mt.table[memoTableIndDirect(&p, mt.varArray, mt.varLen)] = value; break;
+            mt.table[memoTableIndDirect(&p, mt.varyRange)] = value; break;
         case xxhashMap:
             mt.table[(XXH64(&p.vals, sizeof(U32) * NUM_PARAMS, 0) >> 3) % mt.tableLen] = value; break;
         case noMemo:
@@ -1302,17 +1374,15 @@ static void freeMemoTableArray(memoTable_t* const mtAll) {
 
 /* inits memotables for all (including mallocs), all strategies */
 /* takes unsanitized varyParams */
-static memoTable_t* createMemoTableArray(const paramValues_t p, const varInds_t* const varyParams, const size_t varyLen, const U32 memoTableLog) {
+static memoTable_t* createMemoTableArray(const paramRanges_t pr, const U32 memoTableLog) {
     memoTable_t* mtAll = (memoTable_t*)calloc(sizeof(memoTable_t),(ZSTD_btultra + 1));
-    ZSTD_strategy i, stratMin = ZSTD_fast, stratMax = ZSTD_btultra;
+    int i;
     
     if(mtAll == NULL) {
         return NULL;
     }
 
-    for(i = 1; i <= (int)ZSTD_btultra; i++) {
-        mtAll[i].varLen = sanitizeVarArray(mtAll[i].varArray, varyLen, varyParams, i);
-    }
+    for(i = 1; i <= (int)ZSTD_btultra; i++) { mtAll[i].varyRange = sanitizeRanges(pr, i); }
 
     /* no memoization */
     if(memoTableLog == 0) {
@@ -1324,15 +1394,8 @@ static memoTable_t* createMemoTableArray(const paramValues_t p, const varInds_t*
         return mtAll;
     }
 
-    
-    if(p.vals[strt_ind] != PARAM_UNSET) {
-        stratMin = p.vals[strt_ind];
-        stratMax = p.vals[strt_ind];
-    }
-
-
-    for(i = stratMin; i <= stratMax; i++) {
-        size_t mtl = memoTableLen(mtAll[i].varArray, mtAll[i].varLen);
+    for(i = pr.min[strt_ind]; i <= pr.max[strt_ind]; i++) {
+        size_t mtl = memoTableLen(mtAll[i].varyRange);
         mtAll[i].tableType = directMap;
 
         if(memoTableLog != PARAM_UNSET && mtl > (1ULL << memoTableLog)) { /* use hash table */ /* provide some option to only use hash tables? */
@@ -1360,11 +1423,10 @@ static void randomConstrainedParams(paramValues_t* pc, const memoTable_t* memoTa
     const memoTable_t mt = memoTableArray[st];
     pc->vals[strt_ind] = st;
     for(j = 0; j < mt.tableLen; j++) {
-        int i;
-        for(i = 0; i < NUM_PARAMS; i++) {
-            varInds_t v = mt.varArray[i];
+        varInds_t v;
+        for(v = 0; v < NUM_PARAMS; v++) {
             if(v == strt_ind) continue; 
-            pc->vals[v] = rangeMap(v, FUZ_rand(&g_rand) % rangetable[v]);
+            pc->vals[v] = rangeMap(v, FUZ_rand(&g_rand) % (mt.varyRange.max[v] - mt.varyRange.min[v] + 1) + mt.varyRange.min[v]);
         }
 
         if(!(memoTableGet(memoTableArray, *pc))) break; /* only pick unpicked params. */
@@ -2007,17 +2069,16 @@ static winnerInfo_t climbOnce(const constraint_t target,
 
             int offset;
             size_t i, dist;
-            const size_t varLen = mtAll[cparam.vals[strt_ind]].varLen;
             better = 0;
             DEBUGOUTPUT("Start\n");
             cparam = winnerInfo.params;
             candidateInfo.params = cparam;
              /* all dist-1 candidates */
-            for(i = 0; i < varLen; i++) {
+            for(i = 0; i < NUM_PARAMS; i++) {
                 for(offset = -1; offset <= 1; offset += 2) {
                     CHECKTIME(winnerInfo);
                     candidateInfo.params = cparam;
-                    paramVaryOnce(mtAll[cparam.vals[strt_ind]].varArray[i], offset, &candidateInfo.params); 
+                    rangeSafeParamVaryOnce(i, offset, &candidateInfo.params, mtAll[cparam.vals[strt_ind]].varyRange); 
                     
                     if(paramValid(candidateInfo.params)) {
                         int res;
@@ -2039,8 +2100,8 @@ static winnerInfo_t climbOnce(const constraint_t target,
                 continue;
             }
 
-            for(dist = 2; dist < varLen + 2; dist++) { /* varLen is # dimensions */
-                for(i = 0; i < (1 << varLen) / varLen + 2; i++) {
+            for(dist = 2; dist < NUM_PARAMS + 2; dist++) { /* varLen is # dimensions */
+                for(i = 0; i < (1 << NUM_PARAMS) / NUM_PARAMS + 2; i++) {
                     int res;
                     CHECKTIME(winnerInfo);
                     candidateInfo.params = cparam;
@@ -2167,12 +2228,11 @@ static int nextStrategy(const int currentStrategy, const int bestStrategy) {
 static int g_maxTries = 5;
 #define TRY_DECAY 1
 
-static int optimizeForSize(const char* const * const fileNamesTable, const size_t nbFiles, const char* dictFileName, constraint_t target, paramValues_t paramTarget, 
+static int optimizeForSize(const char* const * const fileNamesTable, const size_t nbFiles, const char* dictFileName, constraint_t target, paramRanges_t paramRange, 
     const int cLevelOpt, const int cLevelRun, const U32 memoTableLog)
 {
-    varInds_t varArray [NUM_PARAMS];
     int ret = 0;
-    const size_t varLen = variableParams(paramTarget, varArray, dictFileName != NULL);
+    paramRange = variableParams(paramRange, dictFileName != NULL);
     winnerInfo_t winner = initWinnerInfo(emptyParams());
     memoTable_t* allMT = NULL;
     paramValues_t paramBase;
@@ -2201,7 +2261,7 @@ static int optimizeForSize(const char* const * const fileNamesTable, const size_
     optimizerAdjustInput(&paramTarget, buf.maxBlockSize);
     paramBase = cParamUnsetMin(paramTarget);
 
-    allMT = createMemoTableArray(paramTarget, varArray, varLen, memoTableLog);
+    allMT = createMemoTableArray(paramRange, memoTableLog);
 
     if(!allMT) {
         DISPLAY("MemoTable Init Error\n");
@@ -2467,7 +2527,8 @@ static int badusage(const char* exename)
 
 #define PARSE_SUB_ARGS(stringLong, stringShort, variable) { if (longCommandWArg(&argument, stringLong) || longCommandWArg(&argument, stringShort)) { variable = readU32FromChar(&argument); if (argument[0]==',') { argument++; continue; } else break; } }
 /* 1 if successful parse, 0 otherwise */
-static int parse_params(const char** argptr, paramValues_t* pv) {
+
+static int parse_params(const char** argptr, paramRanges_t* pv) {
     int matched = 0;
     const char* argOrig = *argptr;
     varInds_t v;
@@ -2475,7 +2536,21 @@ static int parse_params(const char** argptr, paramValues_t* pv) {
         if(longCommandWArg(argptr,g_shortParamNames[v]) || longCommandWArg(argptr, g_paramNames[v])) {
             if(**argptr == '=') {
                 (*argptr)++;
-                pv->vals[v] = readU32FromChar(argptr);
+                pv->vals[v] = (int)readU32FromChar(argptr);
+                matched = 1;
+                break;
+            }
+            if(**argptr == '<') {
+                (*argptr)++;
+                pv->max[v] = CLAMP(v, (int)readU32FromChar(argptr) - 1);
+                if(pv->max[v] < pv->min[v]) pv->min[v] = pv->max[v];
+                matched = 1;
+                break;
+            }
+            if(**argptr == '>') {
+                (*argptr)++;
+                pv->min[v] = CLAMP(v, (int)readU32FromChar(argptr) + 1);
+                if(pv->max[v] < pv->min[v]) pv->max[v] = pv->min[v];
                 matched = 1;
                 break;
             }
@@ -2505,7 +2580,7 @@ int main(int argc, const char** argv)
     U32 memoTableLog = PARAM_UNSET;
     constraint_t target = { 0, 0, (U32)-1 }; 
 
-    paramValues_t paramTarget = emptyParams();
+    paramRanges_t paramTarget = emptyRange();
     g_params = emptyParams();
 
     assert(argc>=1);   /* for exename */
